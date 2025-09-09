@@ -65,8 +65,8 @@ class LinearSGDRegressor:
 
     # ---------- utils internos ----------
     def _check_Xy(self, X, y):
-        X = np.asarray(X)
-        y = np.asarray(y).reshape(-1)
+        X = np.asarray(X, dtype=np.float64)
+        y = np.asarray(y, dtype=np.float64).reshape(-1)
         if X.ndim == 1:
             X = X.reshape(-1, 1)
         if X.shape[0] != y.shape[0]:
