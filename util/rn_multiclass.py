@@ -20,8 +20,8 @@ class MulticlassRN:
         self.tolerance = tolerance
         self.verbose = verbose
         self.cost = cost
-        if self.activation not in ('sigmoid', 'tanh'):
-            raise ValueError("activation must be 'sigmoid' or 'tanh'")
+        if self.activation not in ('sigmoid', 'tanh', 'softmax'):
+            raise ValueError("activation must be 'sigmoid', 'tanh', or 'softmax'")
         if self.cost not in ('bce', 'mse'):
             raise ValueError("cost must be 'bce' or 'mse'")
         self.weights = None
@@ -38,12 +38,28 @@ class MulticlassRN:
         """Hyperbolic tangent function"""
         return np.tanh(z)
     
+    def _softmax(self, z):
+        """Numerically stable softmax.
+        Accepts 1D or 2D input and normalizes along the last axis.
+        """
+        z = np.asarray(z)
+        if z.ndim == 1:
+            z_shift = z - np.max(z)
+            exp_z = np.exp(z_shift)
+            return exp_z / np.sum(exp_z)
+        else:
+            z_shift = z - np.max(z, axis=1, keepdims=True)
+            exp_z = np.exp(z_shift)
+            return exp_z / np.sum(exp_z, axis=1, keepdims=True)
+    
     def _activation_function(self, z):
         """Apply the selected activation function"""
         if self.activation == 'sigmoid':
             return self._sigmoid(z)
         elif self.activation == 'tanh':
             return self._tanh(z)
+        elif self.activation == 'softmax':
+            return self._softmax(z)
         else:
             raise ValueError("Activation must be 'sigmoid' or 'tanh'")
     
@@ -97,9 +113,11 @@ class MulticlassRN:
         if self.activation == 'sigmoid':
             # For sigmoid: already in [0,1]
             return predictions
-        else:  # tanh
+        elif self.activation == 'tanh':
             # For tanh: convert from [-1,1] to [0,1]
             return (predictions + 1) / 2
+        else:  # softmax already in [0,1] and sums to 1 per row
+            return predictions
 
     def _compute_loss_and_grad_z_per_sample(self, y_i, z_i):
         """Compute loss scalar and dL/dz for a single sample."""
@@ -113,6 +131,29 @@ class MulticlassRN:
             else:  # mse
                 loss = 0.5 * (a - y_i) ** 2
                 dLdz = (a - y_i) * a * (1 - a)
+        elif self.activation == 'softmax':
+            # z_i is always logits vector (K,) for softmax
+            z_vec = np.atleast_1d(z_i)
+            p = self._softmax(z_vec)
+            
+            # Convert y_i to one-hot if needed
+            if np.isscalar(y_i):
+                yi_idx = int(y_i)
+                y_one = np.zeros_like(p)
+                y_one[yi_idx] = 1.0
+            else:
+                y_arr = np.asarray(y_i).ravel()
+                if y_arr.size == p.size and ((y_arr == 0) | (y_arr == 1)).all():
+                    y_one = y_arr
+                else:
+                    yi_idx = int(y_arr[0])
+                    y_one = np.zeros_like(p)
+                    y_one[yi_idx] = 1.0
+                    
+            p = np.clip(p, eps, 1 - eps)
+            loss = -np.sum(y_one * np.log(p))
+            dLdz_vec = p - y_one
+            return float(loss), dLdz_vec
         else:  # tanh
             a = self._tanh(z_i)
             if self.cost == 'bce':
@@ -146,8 +187,22 @@ class MulticlassRN:
         
         # Initialize parameters
         n_samples, n_features = X.shape
-        self.weights = np.random.normal(0, 0.01, n_features)
-        self.bias = 0
+        # For softmax multiclass, use matrix weights (K, n_features)
+        if self.activation == 'softmax':
+            # If y provided as integers or one-hot, determine K
+            y_arr = np.array(y)
+            if y_arr.ndim == 1:
+                classes = np.unique(y_arr)
+                K = classes.size
+            else:
+                K = y_arr.shape[1]
+            if K <= 1:
+                K = 2
+            self.weights = np.random.normal(0, 0.01, (K, n_features))
+            self.bias = np.zeros(K, dtype=float)
+        else:
+            self.weights = np.random.normal(0, 0.01, n_features)
+            self.bias = 0
         
         if self.verbose:
             print(f"Initial weights: {self.weights}")
@@ -155,7 +210,7 @@ class MulticlassRN:
             print()
         
         # Convert y to numpy array if necessary
-        y = np.array(y).flatten()
+        y = np.array(y)
         
         # Training loop
         prev_loss = None
@@ -164,17 +219,26 @@ class MulticlassRN:
             # loop over samples, SGD-style updates
             for e in range(n_samples):
                 x_i = X[e]
-                z_i = float(np.dot(x_i, self.weights) + self.bias)
-                loss_i, dLdz_i = self._compute_loss_and_grad_z_per_sample(y[e], z_i)
+                if self.activation == 'softmax' and np.ndim(self.weights) == 2:
+                    # multiclass logits vector
+                    z_i = np.dot(self.weights, x_i) + self.bias  # (K,)
+                    loss_i, dLdz_i = self._compute_loss_and_grad_z_per_sample(y[e], z_i)
+                    # gradients
+                    if np.ndim(dLdz_i) == 0:
+                        dLdz_i = np.array([dLdz_i])
+                    self.weights -= self.learning_rate * (dLdz_i[:, None] * x_i[None, :])
+                    self.bias    -= self.learning_rate * dLdz_i
+                else:
+                    # For binary sigmoid/tanh
+                    z_i = float(np.dot(x_i, self.weights) + self.bias)
+                    loss_i, dLdz_i = self._compute_loss_and_grad_z_per_sample(float(y[e]) if y.ndim == 1 else float(np.argmax(y[e])), z_i)
+                    # gradients per sample
+                    dw = x_i * dLdz_i
+                    db = dLdz_i
+                    # update
+                    self.weights -= self.learning_rate * dw
+                    self.bias -= self.learning_rate * db
                 total_loss += loss_i
-
-                # gradients per sample
-                dw = x_i * dLdz_i
-                db = dLdz_i
-
-                # update
-                self.weights -= self.learning_rate * dw
-                self.bias -= self.learning_rate * db
 
             self.cost_history.append(total_loss)
 
@@ -206,19 +270,33 @@ class MulticlassRN:
     
     def predict_proba(self, X):
         """Predict probabilities"""
-        z = np.dot(X, self.weights) + self.bias
-        predictions = self._activation_function(z)
-        return self._normalize_predictions(predictions)
+        if self.activation == 'softmax':
+            # Always use matrix weights for softmax
+            z = X @ self.weights.T + self.bias  # (n_samples, K)
+            return self._softmax(z)
+        else:
+            # Binary sigmoid/tanh
+            z = np.dot(X, self.weights) + self.bias
+            predictions = self._activation_function(z)
+            return self._normalize_predictions(predictions)
     
     def predict(self, X, threshold=0.5):
         """Predict classes"""
         probabilities = self.predict_proba(X)
+        if isinstance(probabilities, np.ndarray) and probabilities.ndim == 2 and probabilities.shape[1] > 1:
+            return np.argmax(probabilities, axis=1)
         return (probabilities >= threshold).astype(int)
     
     def score(self, X, y):
         """Compute accuracy"""
         predictions = self.predict(X)
-        accuracy = np.mean(predictions == y)
+        # If y is one-hot, convert to indices
+        y_arr = np.array(y)
+        if y_arr.ndim > 1 and y_arr.shape[1] > 1:
+            y_idx = np.argmax(y_arr, axis=1)
+        else:
+            y_idx = y_arr
+        accuracy = np.mean(predictions == y_idx)
         
         if self.verbose:
             print(f"Accuracy: {accuracy:.3f}")
